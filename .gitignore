@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+.venv/
+uv.lock
+
+# Secrets / local state
+.env
+.env.*
+!.env.example
+.seed.json
+.loseit_client/
+tokens.json
+
+# Reverse-engineering scratch
+*.bin
+*.mitm
+user_db.sqlite
+mine.txt
+ref.txt
+search_out.bin
+
+# IDE
+.vscode/
+.idea/
+*.swp

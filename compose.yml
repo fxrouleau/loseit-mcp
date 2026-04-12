@@ -1,0 +1,32 @@
+services:
+  loseit-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: loseit-mcp:latest
+    container_name: loseit-mcp
+    restart: unless-stopped
+
+    environment:
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-https://loseit-mcp.felixrouleau.com}
+      MCP_ADMIN_PASSWORD: ${MCP_ADMIN_PASSWORD:?set MCP_ADMIN_PASSWORD}
+
+      # First-boot LoseIt seeds; refreshed tokens are persisted to
+      # /data/loseit_tokens.json so these can be cleared after first start.
+      MCP_LOSEIT_REFRESH_TOKEN: ${MCP_LOSEIT_REFRESH_TOKEN:-}
+      MCP_LOSEIT_ACCESS_TOKEN: ${MCP_LOSEIT_ACCESS_TOKEN:-}
+      MCP_LOSEIT_USER_ID: ${MCP_LOSEIT_USER_ID:-}
+      MCP_LOSEIT_USERNAME: ${MCP_LOSEIT_USERNAME:-}
+
+      TZ: ${TZ:-America/Toronto}
+
+    volumes:
+      - loseit-mcp-data:/data
+
+    # Host Caddy reverse-proxies to this loopback port. Not exposed
+    # on public interfaces.
+    ports:
+      - "127.0.0.1:8787:8787"
+
+volumes:
+  loseit-mcp-data:
