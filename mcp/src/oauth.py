@@ -68,6 +68,17 @@ def _canonical_resource(settings: Settings) -> str:
     return settings.public_url.rstrip("/") + "/mcp"
 
 
+def _resource_matches(provided: str | None, settings: Settings) -> bool:
+    """Return True if `provided` refers to the same MCP resource as our
+    canonical URL. claude.ai sometimes sends the trailing-slash form
+    because FastMCP's Starlette Mount 307-redirects /mcp → /mcp/ and
+    it latches onto the post-redirect URL; accept both."""
+    if not provided:
+        return False
+    canonical = _canonical_resource(settings)
+    return provided.rstrip("/") == canonical.rstrip("/")
+
+
 def _signer(settings: Settings) -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(settings.session_secret, salt="loseit-mcp-consent")
 
@@ -196,11 +207,14 @@ async def authorize_get(request: Request) -> Response:
         return _error("invalid_redirect_uri", "redirect_uri not registered")
     if not code_challenge or code_challenge_method != "S256":
         return _error("invalid_request", "PKCE S256 challenge required")
-    if resource != _canonical_resource(settings):
+    if not _resource_matches(resource, settings):
         return _error(
             "invalid_target",
             f"resource must equal {_canonical_resource(settings)!r}",
         )
+    # Normalize to our canonical form so later comparisons (token
+    # audience, /mcp verifier) don't have to deal with slash variants.
+    resource = _canonical_resource(settings)
 
     consent_payload = {
         "client_id": client_id,
@@ -310,7 +324,7 @@ async def token(request: Request) -> Response:
             return _error("invalid_grant", "redirect_uri mismatch")
         if not _verify_pkce(code_verifier, code_record.code_challenge):
             return _error("invalid_grant", "pkce verification failed")
-        if resource is not None and resource != code_record.resource:
+        if resource is not None and resource.rstrip("/") != (code_record.resource or "").rstrip("/"):
             return _error("invalid_target", "resource mismatch with authorization")
 
         access = store.issue_token(
