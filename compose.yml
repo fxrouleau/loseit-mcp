@@ -1,9 +1,14 @@
 services:
   loseit-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: loseit-mcp:latest
+    # Pre-built image from GitHub Actions (see .github/workflows/build.yml).
+    # Avoids BuildKit on the target host — Portainer just pulls + runs.
+    # For local dev or if you want to build on the target host instead,
+    # uncomment the `build:` block below and remove this image line.
+    image: ghcr.io/fxrouleau/loseit-mcp:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    pull_policy: always
     container_name: loseit-mcp
     restart: unless-stopped
 
