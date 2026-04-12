@@ -69,12 +69,17 @@ def _canonical_resource(settings: Settings) -> str:
 
 
 def _resource_matches(provided: str | None, settings: Settings) -> bool:
-    """Return True if `provided` refers to the same MCP resource as our
-    canonical URL. claude.ai sometimes sends the trailing-slash form
-    because FastMCP's Starlette Mount 307-redirects /mcp → /mcp/ and
-    it latches onto the post-redirect URL; accept both."""
+    """True if `provided` refers to our canonical MCP resource, OR if it
+    is absent entirely.
+
+    claude.ai (as of April 2026) does not send the RFC 8707 `resource`
+    parameter on the authorize request despite the MCP spec mandating
+    it — treat absent as "default to canonical" so the flow works.
+    If they do send it, accept either slash form because FastMCP's
+    307 /mcp → /mcp/ redirect can confuse which URL they latch onto.
+    """
     if not provided:
-        return False
+        return True
     canonical = _canonical_resource(settings)
     return provided.rstrip("/") == canonical.rstrip("/")
 
