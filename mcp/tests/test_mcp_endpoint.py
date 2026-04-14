@@ -402,3 +402,78 @@ def test_refresh_database_tool_calls_client(authed, fake_loseit_client):
     r = _call_tool(client, token, session, "refresh_database", {})
     assert r.status_code == 200, r.text
     fake_loseit_client.refresh_database.assert_called_once()
+
+
+def test_log_food_servings_passed_through_to_catalog(authed, fake_loseit_client):
+    """Regression for the '2 carrots → 2 grams' bug: when a user wants
+    `servings=2` of a catalog food whose serving is in grams, the MCP
+    layer must pass `servings=2` (not `quantity=2`) to the client, so
+    the client multiplies by the serving size instead of treating 2
+    as a raw gram count."""
+    from loseit_client import Food, FoodNutrients, FoodServingSize, MealType
+    from loseit_client.client import LoggedEntry
+
+    catalog_food = Food(
+        unique_id=b"\xcc" * 16,
+        name="Carrot, Whole",
+        brand_name="",
+        category="Carrot",
+        language_tag="en-US",
+        nutrients=FoodNutrients(base_units=61, calories=25, fat=0, carbohydrates=5.8, protein=0.1),
+        servings=[FoodServingSize(size=61, measure_id=8, measure_singular="Gram", measure_plural="Grams")],
+    )
+    fake_loseit_client.search_catalog.return_value = [catalog_food]
+    fake_loseit_client.database.return_value.get_food_by_uuid.return_value = None
+    fake_loseit_client.log_food_from_catalog.return_value = LoggedEntry(
+        entry_uuid=b"\x77" * 16,
+        food_uuid=catalog_food.unique_id,
+        name="Carrot, Whole",
+        calories=50,
+        meal=MealType.LUNCH,
+        server_ack_txn_ids=[1],
+        raw_response_fields=[1],
+    )
+
+    client, token = authed
+    session = _initialize(client, token)
+
+    r = _call_tool(client, token, session, "search_catalog", {"query": "carrot"}, request_id=20)
+    assert r.status_code == 200
+
+    r = _call_tool(
+        client, token, session,
+        "log_food",
+        {"food_uuid": (b"\xcc" * 16).hex(), "meal": "lunch", "servings": 2},
+        request_id=21,
+    )
+    assert r.status_code == 200, r.text
+    body = _extract_sse_json(r.text)
+    assert body["result"].get("isError") is not True, body
+
+    call = fake_loseit_client.log_food_from_catalog.call_args
+    assert call.kwargs["servings"] == 2
+    assert call.kwargs["quantity"] is None  # explicitly NOT passed
+    assert call.kwargs["meal"] == MealType.LUNCH
+
+
+def test_log_food_servings_and_quantity_mutually_exclusive(authed, fake_loseit_client):
+    """Passing both should produce a clear error, not a silent miscompute."""
+    fake_loseit_client.database.return_value.get_food_by_uuid.return_value = None
+    client, token = authed
+    session = _initialize(client, token)
+
+    r = _call_tool(
+        client, token, session,
+        "log_food",
+        {
+            "food_uuid": "00" * 16,
+            "meal": "snacks",
+            "servings": 2,
+            "quantity": 122,
+        },
+    )
+    assert r.status_code == 200
+    body = _extract_sse_json(r.text)
+    assert body["result"].get("isError") is True
+    text = body["result"]["content"][0]["text"]
+    assert "servings" in text and "quantity" in text

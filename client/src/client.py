@@ -36,6 +36,25 @@ class LoggedEntry:
     raw_response_fields: list[int]
 
 
+def _local_scale(food, *, servings: float | None, quantity: float | None) -> float:
+    """Resolve a `(servings, quantity)` pair into a single multiplier on
+    a local food's stored last-used serving.
+
+    * `servings`: number of standard servings → multiplier is just N.
+      Matches the LoseIt app picker: "2" of a 61g serving = 122 grams.
+    * `quantity`: explicit raw amount in the food's measure unit, used
+      when the caller wants e.g. "exactly 200 grams". The multiplier is
+      `quantity / last_serving_quantity`.
+    * Neither: 1 serving (the food's last-used quantity).
+    """
+    last_q = food.last_serving_quantity or 1.0
+    if servings is not None:
+        return float(servings)
+    if quantity is not None:
+        return float(quantity) / last_q
+    return 1.0
+
+
 class LoseItClient:
     """Minimal LoseIt client. Covers:
 
@@ -176,15 +195,19 @@ class LoseItClient:
         entry_uuid: bytes,
         food_uuid: bytes,
         meal: MealType,
+        servings: float | None = None,
         quantity: float | None = None,
         day: Optional[dt.date] = None,
     ) -> LoggedEntry:
-        """Edit an existing food log entry (one previously created via
-        `log_food` or the native app). Reuses the same entry_uuid so the
-        server upserts rather than inserting a new row. The food metadata
-        is re-looked-up from the local library by uuid.
+        """Edit an existing food log entry. Reuses the entry_uuid so the
+        server upserts rather than inserting a new row.
+
+        See `log_food` for the difference between `servings` and `quantity`.
         """
         from .bundle import build_log_food_bundle
+
+        if servings is not None and quantity is not None:
+            raise ValueError("pass servings OR quantity, not both")
 
         db = self.database(refresh=False)
         food = db.get_food_by_uuid(food_uuid)
@@ -192,8 +215,8 @@ class LoseItClient:
             raise KeyError(
                 f"food {food_uuid.hex()} not in local db; call refresh_database()"
             )
-        qty = quantity if quantity is not None else food.last_serving_quantity
-        scale = qty / food.last_serving_quantity if food.last_serving_quantity else 1.0
+        scale = _local_scale(food, servings=servings, quantity=quantity)
+        raw_amount = (food.last_serving_quantity or 1.0) * scale
         bundle, _ = build_log_food_bundle(
             food_uuid=food.food_uuid,
             food_name=food.name,
@@ -201,8 +224,8 @@ class LoseItClient:
             measure_id=food.measure_id,
             measure_singular=food.measure_name,
             measure_plural=food.measure_name_plural,
-            serving_quantity=qty,
-            serving_base_units=food.last_serving_base_units * scale,
+            serving_quantity=raw_amount,
+            serving_base_units=raw_amount,
             calories=food.last_serving_calories * scale,
             fat=food.last_serving_fat * scale,
             carbohydrate=food.last_serving_carbohydrate * scale,
@@ -230,18 +253,36 @@ class LoseItClient:
         *,
         food_uuid: bytes,
         meal: MealType,
+        servings: float | None = None,
         quantity: float | None = None,
         measure_id: int | None = None,
         day: Optional[dt.date] = None,
     ) -> LoggedEntry:
         """Log an existing food from the user's library by uuid.
 
-        Uses the food's last-used serving from ActiveFoods by default.
-        Pass `quantity` to scale the serving. Pass `measure_id` (a
-        `FoodMeasureId` value) to log the food in a different unit — the
-        client will look it up in LoseIt's catalog to find the alternate
-        serving and re-scale the nutrition.
+        Args:
+            food_uuid: the food's uuid.
+            meal: which meal to log under.
+            servings: number of standard servings to log. This is the
+                "natural" parameter — `servings=2` of a food whose
+                last-used serving was "1 Each" gives "2 Each", and
+                `servings=2` of a food whose last-used serving was "61
+                Grams" gives "122 Grams". Use this for "log 2 carrots".
+            quantity: explicit raw amount in the food's measure unit.
+                Bypasses servings math. Use for "log exactly 200 grams
+                of rice" when the food is stored in grams.
+            measure_id: optional unit override. When set, the client
+                looks up the food in the catalog under the requested
+                measure (e.g. GRAM, CUP) and uses that serving as the
+                basis. servings/quantity then apply to the new unit.
+            day: ISO date or None for today.
+
+        servings and quantity are mutually exclusive. If neither is
+        given, the food's last-used serving is logged once (servings=1).
         """
+        if servings is not None and quantity is not None:
+            raise ValueError("pass servings OR quantity, not both")
+
         db = self.database(refresh=False)
         food = db.get_food_by_uuid(food_uuid)
         if food is None:
@@ -251,13 +292,13 @@ class LoseItClient:
             # User wants a unit the local library doesn't store. Try to
             # find the food in the catalog and pick the matching serving.
             return self._log_food_alt_unit(
-                food=food, meal=meal, quantity=quantity,
+                food=food, meal=meal,
+                servings=servings, quantity=quantity,
                 measure_id=measure_id, day=day,
             )
 
-        qty = quantity if quantity is not None else food.last_serving_quantity
-        base = food.last_serving_base_units
-        scale = qty / food.last_serving_quantity if food.last_serving_quantity else 1.0
+        scale = _local_scale(food, servings=servings, quantity=quantity)
+        raw_amount = (food.last_serving_quantity or 1.0) * scale
 
         bundle, entry_uuid = build_log_food_bundle(
             food_uuid=food.food_uuid,
@@ -266,8 +307,8 @@ class LoseItClient:
             measure_id=food.measure_id,
             measure_singular=food.measure_name,
             measure_plural=food.measure_name_plural,
-            serving_quantity=qty,
-            serving_base_units=base * scale,
+            serving_quantity=raw_amount,
+            serving_base_units=raw_amount,
             calories=food.last_serving_calories * scale,
             fat=food.last_serving_fat * scale,
             carbohydrate=food.last_serving_carbohydrate * scale,
@@ -294,6 +335,7 @@ class LoseItClient:
         *,
         food,
         meal: MealType,
+        servings: float | None,
         quantity: float | None,
         measure_id: int,
         day: Optional[dt.date],
@@ -326,7 +368,8 @@ class LoseItClient:
                 f"available: {available}"
             )
         return self.log_food_from_catalog(
-            match, meal=meal, quantity=quantity,
+            match, meal=meal,
+            servings=servings, quantity=quantity,
             serving_index=serving_index, day=day,
         )
 
@@ -463,18 +506,26 @@ class LoseItClient:
         food: Food,
         *,
         meal: MealType,
+        servings: float | None = None,
         quantity: float | None = None,
         serving_index: int = 0,
         day: Optional[dt.date] = None,
     ) -> LoggedEntry:
         """Log a food obtained from barcode lookup or catalog search.
 
-        Picks `food.servings[serving_index]` as the unit. Barcode responses
-        typically expose multiple servings (e.g. Skittles returns both
-        "27 Pieces" and "40 Grams") — inspect `food.servings` to see what's
-        available, then pass the index of the one you want.
+        Picks `food.servings[serving_index]` as the unit basis. Barcode
+        responses sometimes expose multiple servings (e.g. Skittles returns
+        "27 Pieces" + "40 Grams") — pick the one you want.
+
+        See `log_food` for the difference between `servings` and `quantity`:
+
+        * servings=2 of a food whose serving is "61 Grams"  → 122 Grams
+        * quantity=100 of a food whose serving is "61 Grams" → 100 Grams
+        * default (neither set)                              → 1 serving
         """
         from .bundle import build_log_food_bundle, measure_labels
+        if servings is not None and quantity is not None:
+            raise ValueError("pass servings OR quantity, not both")
         if not food.servings:
             raise ValueError(f"food {food.name!r} has no serving sizes")
         if not (0 <= serving_index < len(food.servings)):
@@ -486,12 +537,16 @@ class LoseItClient:
         n = food.nutrients
         if n is None:
             raise ValueError(f"food {food.name!r} has no nutrient data")
-        qty = quantity if quantity is not None else s.size
-        # v1 FoodNutrients has no explicit base_units — the nutrition is
-        # "per first serving size". Pick that as the unit so the server
-        # computes qty × (calories / base) correctly.
-        base = s.size or 1.0
-        scale = qty / base
+
+        serving_size = s.size or 1.0
+        if servings is not None:
+            scale = servings
+        elif quantity is not None:
+            scale = quantity / serving_size
+        else:
+            scale = 1.0
+        raw_amount = serving_size * scale
+
         # decode_food_serving_size already filled these, but fall back
         # through the enum table in case it encountered an unknown id.
         singular = s.measure_singular or measure_labels(s.measure_id)[0]
@@ -504,8 +559,8 @@ class LoseItClient:
             measure_id=s.measure_id,
             measure_singular=singular,
             measure_plural=plural,
-            serving_quantity=qty,
-            serving_base_units=base,
+            serving_quantity=raw_amount,
+            serving_base_units=raw_amount,
             calories=n.calories * scale,
             fat=n.fat * scale,
             carbohydrate=n.carbohydrates * scale,
@@ -521,7 +576,7 @@ class LoseItClient:
             entry_uuid=entry_uuid,
             food_uuid=food.unique_id,
             name=food.name,
-            calories=n.calories,
+            calories=n.calories * scale,
             meal=meal,
             server_ack_txn_ids=parsed["ack_txn_ids"],
             raw_response_fields=parsed["raw_fields"],

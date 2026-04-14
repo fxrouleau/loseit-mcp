@@ -207,6 +207,7 @@ def register(mcp: Any, client: LoseItClient) -> None:
     def log_food(
         food_uuid: str,
         meal: str,
+        servings: Optional[float] = None,
         quantity: Optional[float] = None,
         measure: Optional[str] = None,
         serving_index: int = 0,
@@ -222,17 +223,39 @@ def register(mcp: Any, client: LoseItClient) -> None:
         The tool figures out which source the uuid came from
         automatically — you don't need to track it.
 
+        ## How to specify "how much"
+
+        There are two parameters and they mean different things —
+        pick the right one for the user's intent:
+
+        **`servings`** = number of standard servings of the food. This
+        is what you want for natural-language "log 2 carrots" / "log 3
+        eggs" / "log 1 protein bar". One serving means whatever the
+        food's stored serving size is — for an apple stored as
+        "1 Each" that's one apple, for a carrot whose catalog entry
+        uses "61 Grams" that's one 61g carrot. **`servings=2` of the
+        61g carrot logs 122 grams, not 2 grams.**
+
+        **`quantity`** = explicit raw amount in the food's measure
+        unit. Use this when the user gives a precise weight or volume
+        ("log 200 grams of rice", "log 1.5 cups of oatmeal") AND the
+        food's serving is in the same unit. `quantity=200` on a food
+        whose serving is in grams logs exactly 200 grams.
+
+        Default (neither set) = 1 serving. 90% of LLM calls should
+        either omit both or pass `servings=N`.
+
         Args:
             food_uuid: hex uuid from a search/lookup response.
             meal: "breakfast" | "lunch" | "dinner" | "snacks".
-            quantity: amount to log. Defaults to the food's stored
-                serving size (or `servings[serving_index].size` for
-                catalog foods).
+            servings: number of servings (multiplier). See above.
+            quantity: explicit raw amount in the measure's unit. See
+                above. Mutually exclusive with `servings`.
             measure: optional unit override for foods from
                 search_foods, e.g. "GRAM", "CUP" — see list_units. The
                 tool re-fetches the food in the requested unit from
-                the catalog. Ignored for catalog foods (use
-                serving_index instead).
+                the catalog. servings/quantity then apply to the new
+                measure.
             serving_index: which entry of the food's `servings` list
                 to use, for catalog/barcode foods that expose multiple
                 units (e.g. "27 Pieces" + "40 Grams"). Default 0 picks
@@ -244,6 +267,9 @@ def register(mcp: Any, client: LoseItClient) -> None:
         Note: this is for individual foods only. For complex meals
         without a clear catalog match, use log_calories instead.
         """
+        if servings is not None and quantity is not None:
+            raise ValueError("pass `servings` OR `quantity`, not both")
+
         fu = bytes.fromhex(food_uuid)
 
         # Try the user's personal library first — it has the exact
@@ -254,6 +280,7 @@ def register(mcp: Any, client: LoseItClient) -> None:
             r = client.log_food(
                 food_uuid=fu,
                 meal=_meal_from_str(meal),
+                servings=servings,
                 quantity=quantity,
                 measure_id=_measure_from_str(measure),
                 day=_date_from_str(date),
@@ -269,6 +296,7 @@ def register(mcp: Any, client: LoseItClient) -> None:
             r = client.log_food_from_catalog(
                 cached,
                 meal=_meal_from_str(meal),
+                servings=servings,
                 quantity=quantity,
                 serving_index=serving_index,
                 day=_date_from_str(date),
@@ -329,17 +357,24 @@ def register(mcp: Any, client: LoseItClient) -> None:
         entry_uuid: str,
         food_uuid: str,
         meal: str,
+        servings: Optional[float] = None,
         quantity: Optional[float] = None,
         date: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Change the quantity of an existing food log entry (reuses
+        """Change the amount of an existing food log entry (reuses
         its uuid). Pass the entry_uuid + food_uuid you got from
         get_day_log.
+
+        See `log_food` for the difference between `servings` and
+        `quantity`. They are mutually exclusive.
         """
+        if servings is not None and quantity is not None:
+            raise ValueError("pass `servings` OR `quantity`, not both")
         r = client.edit_food_entry(
             entry_uuid=bytes.fromhex(entry_uuid),
             food_uuid=bytes.fromhex(food_uuid),
             meal=_meal_from_str(meal),
+            servings=servings,
             quantity=quantity,
             day=_date_from_str(date),
         )

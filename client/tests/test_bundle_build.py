@@ -109,6 +109,45 @@ def test_meal_enum_values_land_on_wire():
         assert ctx[3][0] == int(meal), f"meal {meal.name} not on wire"
 
 
+def test_log_food_bundle_keeps_size_and_base_units_consistent():
+    """Regression: a previous bug had the catalog log path scaling
+    calories without scaling base_units, so the wire bundle had
+    serving_size != base_units and the server interpreted the request
+    as a tiny gram amount (e.g. logging "2 grams" instead of "2 carrots").
+    The two fields must always agree."""
+    from loseit_client.pb import f64_from_uint
+
+    data, _ = build_log_food_bundle(
+        food_uuid=b"\x33" * 16,
+        food_name="Carrot",
+        food_product_name="Carrot",
+        measure_id=int(FoodMeasureId.GRAM),
+        measure_singular="Gram",
+        measure_plural="Grams",
+        serving_quantity=122,
+        serving_base_units=122,
+        calories=50,
+        fat=0,
+        carbohydrate=12,
+        protein=1,
+        meal=int(MealType.LUNCH),
+        user_id=USER_ID,
+        sync_token=SYNC_TOKEN,
+    )
+    txn = read_message(read_message(data)[1][0])
+    fle = read_message(txn[7][0])
+    serving = read_message(fle[4][0])
+
+    size_msg = read_message(serving[1][0])
+    nutrients_msg = read_message(serving[2][0])
+
+    serving_size = f64_from_uint(size_msg[2][0])
+    base_units = f64_from_uint(nutrients_msg[1][0])
+    assert serving_size == base_units == 122.0, (
+        f"size {serving_size} != base_units {base_units}; bundle is malformed"
+    )
+
+
 # ---- Delete tombstone ----
 
 def test_delete_bundle_sets_deleted_flag():
