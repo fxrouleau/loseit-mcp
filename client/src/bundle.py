@@ -146,6 +146,14 @@ UNSET_U64 = -1
 # Verified against captured bundles: day 9233 ↔ 2026-04-12.
 LOSEIT_EPOCH = dt.date(2000, 12, 31)
 
+# Hardcoded "Calories" food UUID. The native Android app treats this as a
+# singleton and renders entries using its real calorie-count label instead
+# of the serving description (see `U9.C4665h0.I0/R` in the decompile).
+# Using any other UUID makes the Add Calories UI fall back to the generic
+# "I picked a food from search" layout and the description override is
+# not applied.
+CALORIES_FOOD_UUID = uuid.UUID("E7EAD450-DB47-40A3-9BEE-6027B96EF723").bytes
+
 
 def days_since_loseit_epoch(when: dt.date | None = None) -> int:
     return ((when or dt.date.today()) - LOSEIT_EPOCH).days
@@ -415,7 +423,9 @@ class CaloriesEntry:
     meal: MealType = MealType.SNACKS
     day: dt.date | None = None          # default: today
     entry_uuid: bytes = field(default_factory=new_uuid16)
-    food_uuid: bytes = field(default_factory=new_uuid16)
+    # Must be the Calories singleton for the app to render this as a
+    # native Add Calories entry.
+    food_uuid: bytes = field(default_factory=lambda: CALORIES_FOOD_UUID)
 
 
 def build_add_calories_bundle(
