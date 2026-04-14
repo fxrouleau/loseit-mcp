@@ -452,28 +452,5 @@ def test_log_food_servings_passed_through_to_catalog(authed, fake_loseit_client)
 
     call = fake_loseit_client.log_food_from_catalog.call_args
     assert call.kwargs["servings"] == 2
-    assert call.kwargs["quantity"] is None  # explicitly NOT passed
+    assert "quantity" not in call.kwargs  # MCP layer doesn't expose this
     assert call.kwargs["meal"] == MealType.LUNCH
-
-
-def test_log_food_servings_and_quantity_mutually_exclusive(authed, fake_loseit_client):
-    """Passing both should produce a clear error, not a silent miscompute."""
-    fake_loseit_client.database.return_value.get_food_by_uuid.return_value = None
-    client, token = authed
-    session = _initialize(client, token)
-
-    r = _call_tool(
-        client, token, session,
-        "log_food",
-        {
-            "food_uuid": "00" * 16,
-            "meal": "snacks",
-            "servings": 2,
-            "quantity": 122,
-        },
-    )
-    assert r.status_code == 200
-    body = _extract_sse_json(r.text)
-    assert body["result"].get("isError") is True
-    text = body["result"]["content"][0]["text"]
-    assert "servings" in text and "quantity" in text
