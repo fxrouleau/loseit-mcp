@@ -110,12 +110,12 @@ def test_mcp_tools_list_has_every_tool(authed):
     expected = {
         "list_units",
         "get_day_log",
+        "refresh_database",
         "search_foods",
         "search_catalog",
         "search_recipes",
         "barcode_lookup",
         "log_food",
-        "log_food_from_barcode",
         "log_calories",
         "edit_log_entry",
         "delete_log_entry",
@@ -283,3 +283,122 @@ def test_log_calories_delegates(authed, fake_loseit_client):
     assert call.kwargs["carbohydrate"] == 30
     assert call.kwargs["protein"] == 15
     assert call.kwargs["meal"] == MealType.DINNER
+
+
+def _initialize(client, token):
+    r = client.post(
+        "/mcp/",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "1"},
+            },
+        },
+        headers=_mcp_headers(token),
+    )
+    session = r.headers["mcp-session-id"]
+    client.post(
+        "/mcp/",
+        json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        headers=_mcp_headers(token, session),
+    )
+    return session
+
+
+def _call_tool(client, token, session, name: str, args: dict, *, request_id: int = 99):
+    return client.post(
+        "/mcp/",
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        },
+        headers=_mcp_headers(token, session),
+    )
+
+
+def test_log_food_unknown_uuid_raises_helpful_error(authed, fake_loseit_client):
+    """A uuid that hasn't been seen via search/lookup should produce a
+    pointed error telling the LLM what to call first."""
+    # Local lookup returns None
+    fake_loseit_client.database.return_value.get_food_by_uuid.return_value = None
+
+    client, token = authed
+    session = _initialize(client, token)
+
+    r = _call_tool(
+        client, token, session,
+        "log_food",
+        {"food_uuid": "00" * 16, "meal": "snacks"},
+    )
+    assert r.status_code == 200, r.text  # MCP errors come back inside the JSON-RPC body
+    body = _extract_sse_json(r.text)
+    assert body["result"].get("isError") is True, body
+    text = body["result"]["content"][0]["text"]
+    assert "search_catalog" in text or "search_foods" in text or "barcode_lookup" in text
+
+
+def test_log_food_routes_catalog_uuid_via_cache(authed, fake_loseit_client):
+    """search_catalog populates the in-process catalog cache; a follow-up
+    log_food with the catalog uuid should resolve via the cache and
+    delegate to client.log_food_from_catalog."""
+    from loseit_client import Food, FoodNutrients, FoodServingSize, MealType
+    from loseit_client.client import LoggedEntry
+
+    catalog_food = Food(
+        unique_id=b"\xab" * 16,
+        name="Banana",
+        brand_name="",
+        category="Fruit",
+        language_tag="en-US",
+        nutrients=FoodNutrients(base_units=1, calories=89, fat=0.3, carbohydrates=23, protein=1.1),
+        servings=[FoodServingSize(size=1, measure_id=5, measure_singular="Each", measure_plural="Each")],
+    )
+    fake_loseit_client.search_catalog.return_value = [catalog_food]
+    fake_loseit_client.database.return_value.get_food_by_uuid.return_value = None
+    fake_loseit_client.log_food_from_catalog.return_value = LoggedEntry(
+        entry_uuid=b"\x99" * 16,
+        food_uuid=catalog_food.unique_id,
+        name="Banana",
+        calories=89,
+        meal=MealType.BREAKFAST,
+        server_ack_txn_ids=[1],
+        raw_response_fields=[1],
+    )
+
+    client, token = authed
+    session = _initialize(client, token)
+
+    # Populate the cache via search_catalog
+    r = _call_tool(client, token, session, "search_catalog", {"query": "banana"}, request_id=10)
+    assert r.status_code == 200, r.text
+
+    # Now log_food with the catalog uuid — should hit log_food_from_catalog
+    r = _call_tool(
+        client, token, session,
+        "log_food",
+        {"food_uuid": (b"\xab" * 16).hex(), "meal": "breakfast"},
+        request_id=11,
+    )
+    assert r.status_code == 200, r.text
+    body = _extract_sse_json(r.text)
+    assert body["result"].get("isError") is not True, body
+
+    fake_loseit_client.log_food_from_catalog.assert_called_once()
+    fake_loseit_client.log_food.assert_not_called()
+    args = fake_loseit_client.log_food_from_catalog.call_args
+    assert args.args[0].name == "Banana"
+    assert args.kwargs["meal"] == MealType.BREAKFAST
+
+
+def test_refresh_database_tool_calls_client(authed, fake_loseit_client):
+    client, token = authed
+    session = _initialize(client, token)
+    r = _call_tool(client, token, session, "refresh_database", {})
+    assert r.status_code == 200, r.text
+    fake_loseit_client.refresh_database.assert_called_once()
