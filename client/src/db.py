@@ -78,6 +78,24 @@ class RecipeRow:
     notes: Optional[str]
 
 
+@dataclass
+class DailyLogState:
+    """The user's current DailyLogEntries row for a given day.
+
+    Holds the values that drive the calorie banner at the top of the
+    LoseIt app. The client reads this before a log mutation, adds the
+    delta from the new food, and sends back an updated DailyLogEntry
+    in the same bundle so the banner stays in sync.
+    """
+    date_day: int
+    current_weight: float
+    current_eer: float
+    current_activity_level: int
+    budget_calories: float
+    food_calories: float
+    exercise_calories: float
+
+
 class UserDatabase:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -144,6 +162,55 @@ class UserDatabase:
             )
             for r in rows
         ]
+
+    def get_daily_log_state(self, day: dt.date) -> Optional[DailyLogState]:
+        """Return today's DailyLogEntries row as a DailyLogState, or None
+        if the row doesn't exist (first-ever interaction on that day)."""
+        day_num = date_to_day(day)
+        row = self._con.execute(
+            """
+            SELECT Date, CurrentWeight, CurrentEER, CurrentActivityLevel,
+                   BudgetCalories, FoodCalories, ExerciseCalories
+            FROM DailyLogEntries
+            WHERE Date = ?
+            """,
+            (day_num,),
+        ).fetchone()
+        if row is None:
+            return None
+        return DailyLogState(
+            date_day=row["Date"],
+            current_weight=row["CurrentWeight"] or 0.0,
+            current_eer=row["CurrentEER"] or 0.0,
+            current_activity_level=row["CurrentActivityLevel"] or 1,
+            budget_calories=row["BudgetCalories"] or 0.0,
+            food_calories=row["FoodCalories"] or 0.0,
+            exercise_calories=row["ExerciseCalories"] or 0.0,
+        )
+
+    def get_most_recent_daily_log_state(self) -> Optional[DailyLogState]:
+        """Fallback when no row exists for the requested day — the user's
+        most recent DailyLogEntries row, used as a profile template."""
+        row = self._con.execute(
+            """
+            SELECT Date, CurrentWeight, CurrentEER, CurrentActivityLevel,
+                   BudgetCalories, FoodCalories, ExerciseCalories
+            FROM DailyLogEntries
+            ORDER BY Date DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return DailyLogState(
+            date_day=row["Date"],
+            current_weight=row["CurrentWeight"] or 0.0,
+            current_eer=row["CurrentEER"] or 0.0,
+            current_activity_level=row["CurrentActivityLevel"] or 1,
+            budget_calories=row["BudgetCalories"] or 0.0,
+            food_calories=row["FoodCalories"] or 0.0,
+            exercise_calories=row["ExerciseCalories"] or 0.0,
+        )
 
     def _resolve_name(self, food_uuid: bytes) -> str:
         """Fallback when a log entry points at a food not in ActiveFoods.

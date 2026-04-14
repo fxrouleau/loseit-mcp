@@ -375,6 +375,60 @@ def entity_value(
     return w.build()
 
 
+# ---------- DailyLogEntry (drives the "X cal today" banner) -------
+
+def daily_log_entry(
+    *,
+    date_day: int,
+    budget_calories: float,
+    weight: float,
+    eer: float,
+    activity_level: int,
+    food_calories: float,
+    exercise_calories: float,
+    last_updated_ms: int | None = None,
+) -> bytes:
+    """DailyLogEntry — field 12 on LoseItGatewayTransaction.
+
+    Carries the running daily totals shown in the calorie budget banner
+    (FoodCalories) and the user's profile context (weight, EER,
+    activity level). The native app re-sends this message on every food
+    log so the server (and the banner) stay in sync with the day's total.
+
+    Wire layout verified against captured `req_021_2530.bin`:
+
+    ```
+    1 [varint] Date (days since 2000-12-31)
+    2 [msg] profile {
+        1 [f64] BudgetCalories
+        2 [msg] activity {
+            1 [f64] Weight
+            2 [f64] EER
+            3 [varint] ActivityLevel
+        }
+    }
+    3 [f64] FoodCalories          ← the banner
+    4 [f64] ExerciseCalories
+    5 [varint] LastUpdated (ms)
+    ```
+    """
+    activity = (
+        Writer()
+        .f64(1, weight)
+        .f64(2, eer)
+        .varint(3, activity_level)
+        .build()
+    )
+    profile = Writer().f64(1, budget_calories).submsg(2, activity).build()
+    w = Writer()
+    w.varint(1, date_day)
+    w.submsg(2, profile)
+    w.f64(3, food_calories)
+    w.f64(4, exercise_calories)
+    w.varint(5, last_updated_ms if last_updated_ms is not None else now_ms())
+    return w.build()
+
+
 # ---------- LoseItGatewayTransaction envelope ----------
 
 def gateway_transaction(
@@ -383,6 +437,7 @@ def gateway_transaction(
     active_foods: list[bytes] | None = None,
     food_log_entries: list[bytes] | None = None,
     entity_values: list[bytes] | None = None,
+    daily_log_entry_bytes: bytes | None = None,
     unknown_16: int = 2,
 ) -> bytes:
     w = Writer()
@@ -391,9 +446,24 @@ def gateway_transaction(
         w.submsg(2, af)
     for fle in food_log_entries or []:
         w.submsg(7, fle)
+    if daily_log_entry_bytes is not None:
+        w.submsg(12, daily_log_entry_bytes)
     w.varint(16, unknown_16)
     for ev in entity_values or []:
         w.submsg(23, ev)
+    return w.build()
+
+
+def gateway_transaction_daily_update(
+    *, txn_id: int, daily_log_entry_bytes: bytes, unknown_16: int = 2
+) -> bytes:
+    """Build a standalone TransactionRecord whose only payload is an
+    updated DailyLogEntry. The native app always splits the DailyLogEntry
+    update into its own record in the batch."""
+    w = Writer()
+    w.varint(1, txn_id)
+    w.submsg(12, daily_log_entry_bytes)
+    w.varint(16, unknown_16)
     return w.build()
 
 
@@ -433,6 +503,7 @@ def build_add_calories_bundle(
     *,
     user_id: int,
     sync_token: int,
+    daily_log_entry_bytes: bytes | None = None,
 ) -> bytes:
     """One-shot "Add Calories" flow.
 
@@ -440,6 +511,10 @@ def build_add_calories_bundle(
     wraps it in an ActiveFood record, and logs a single unit of it under the
     chosen meal. An EntityValue override supplies the display name so the UI
     shows e.g. "mcp-test-e2e-1" instead of "Calories".
+
+    If `daily_log_entry_bytes` is provided, a second TransactionRecord is
+    appended that carries the updated DailyLogEntry so the calorie banner
+    stays in sync with the new log entry.
     """
     now = now_ms()
     day = days_since_loseit_epoch(entry.day)
@@ -485,14 +560,23 @@ def build_add_calories_bundle(
         created_at_ms=now,
     )
 
-    txn = gateway_transaction(
-        txn_id=new_txn_id(),
-        active_foods=[af],
-        food_log_entries=[fle],
-        entity_values=[name_override],
-    )
+    txns: list[bytes] = [
+        gateway_transaction(
+            txn_id=new_txn_id(),
+            active_foods=[af],
+            food_log_entries=[fle],
+            entity_values=[name_override],
+        )
+    ]
+    if daily_log_entry_bytes is not None:
+        txns.append(
+            gateway_transaction_daily_update(
+                txn_id=new_txn_id(),
+                daily_log_entry_bytes=daily_log_entry_bytes,
+            )
+        )
     return gateway_bundle_request(
-        transactions=[txn],
+        transactions=txns,
         sync_token=sync_token,
         database_user_id=user_id,
     )
@@ -519,6 +603,7 @@ def build_log_food_bundle(
     entry_uuid: bytes | None = None,
     extra_nutrients: dict[str, float] | None = None,
     order: int = 0,
+    daily_log_entry_bytes: bytes | None = None,
 ) -> tuple[bytes, bytes]:
     """Log an existing food from the user's library.
 
@@ -529,6 +614,10 @@ def build_log_food_bundle(
     `serving_base_units` is FoodNutrients.baseUnits — the "per this amount"
     field that tells the server how much of the food the nutrition values
     correspond to (e.g. 1 for "1 Each", 100 for "100 grams").
+
+    If `daily_log_entry_bytes` is provided, a second TransactionRecord
+    with the updated DailyLogEntry is appended so the calorie banner
+    reflects the new entry.
     """
     day_num = days_since_loseit_epoch(day)
     entry_uuid = entry_uuid or new_uuid16()
@@ -568,14 +657,23 @@ def build_log_food_bundle(
         food_serving_bytes=serving,
         created_at_ms=now,
     )
-    txn = gateway_transaction(
-        txn_id=new_txn_id(),
-        active_foods=[af],
-        food_log_entries=[fle],
-    )
+    txns: list[bytes] = [
+        gateway_transaction(
+            txn_id=new_txn_id(),
+            active_foods=[af],
+            food_log_entries=[fle],
+        )
+    ]
+    if daily_log_entry_bytes is not None:
+        txns.append(
+            gateway_transaction_daily_update(
+                txn_id=new_txn_id(),
+                daily_log_entry_bytes=daily_log_entry_bytes,
+            )
+        )
     return (
         gateway_bundle_request(
-            transactions=[txn], sync_token=sync_token, database_user_id=user_id
+            transactions=txns, sync_token=sync_token, database_user_id=user_id
         ),
         entry_uuid,
     )
@@ -892,12 +990,17 @@ def build_delete_log_bundle(
     measure_id: int = FoodMeasureId.EACH,
     measure_singular: str = "Each",
     measure_plural: str = "Each",
+    daily_log_entry_bytes: bytes | None = None,
 ) -> bytes:
     """Delete an existing food log entry.
 
     The LoseIt sync protocol uses tombstones: the delete is the full
     FoodLogEntry re-sent with the `deleted` bool flipped on. All of the
     food/serving content has to be there — the server resolves by uuid.
+
+    If `daily_log_entry_bytes` is provided, a second TransactionRecord
+    with the updated DailyLogEntry is appended so the calorie banner
+    decrements to match.
     """
     day_num = days_since_loseit_epoch(day)
     food_id = food_identifier(
@@ -928,12 +1031,18 @@ def build_delete_log_bundle(
         deleted=True,
     )
     fle = food_log_entry(context=ctx, food=food_id, serving=serving)
-    txn = gateway_transaction(
-        txn_id=new_txn_id(),
-        food_log_entries=[fle],
-    )
+    txns: list[bytes] = [
+        gateway_transaction(txn_id=new_txn_id(), food_log_entries=[fle])
+    ]
+    if daily_log_entry_bytes is not None:
+        txns.append(
+            gateway_transaction_daily_update(
+                txn_id=new_txn_id(),
+                daily_log_entry_bytes=daily_log_entry_bytes,
+            )
+        )
     return gateway_bundle_request(
-        transactions=[txn], sync_token=sync_token, database_user_id=user_id
+        transactions=txns, sync_token=sync_token, database_user_id=user_id
     )
 
 

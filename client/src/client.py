@@ -11,16 +11,19 @@ from .bundle import (
     CaloriesEntry,
     FoodMeasureId,
     IngredientSpec,
+    LOSEIT_EPOCH,
     MealType,
     build_add_calories_bundle,
     build_create_recipe_bundle,
     build_delete_log_bundle,
     build_delete_recipe_bundle,
     build_log_food_bundle,
+    daily_log_entry,
     new_uuid16,
+    now_ms,
     parse_bundle_response,
 )
-from .db import DEFAULT_CACHE, LogRow, UserDatabase
+from .db import DEFAULT_CACHE, DailyLogState, LogRow, UserDatabase
 from .food_search import Food, decode_food, decode_food_search_response
 from .transport import Transport
 
@@ -100,6 +103,66 @@ class LoseItClient:
         tokens = self.auth.ensure_fresh()
         return tokens.user_id
 
+    # ---- daily banner delta -------------------------------------
+
+    def _build_daily_log_delta(
+        self,
+        when: dt.date | None,
+        delta_calories: float,
+    ) -> bytes | None:
+        """Build a DailyLogEntry update that reflects `delta_calories`
+        being added to the given day's banner total.
+
+        The native Android app re-sends DailyLogEntry on every food
+        mutation. Without it, DailyLogEntries.FoodCalories stays stuck
+        at whatever value the native app last wrote, so the "X cal
+        today" banner at the top of the app drifts out of sync with
+        the actual log entries.
+
+        We refresh the database snapshot so the read of FoodCalories
+        reflects any mutations made since our last call (including
+        from the native app). If no DailyLogEntries row exists for the
+        target day yet (first-ever log of the day), we seed from the
+        most recent row's profile fields.
+        """
+        day = when or dt.date.today()
+        db = self.database(refresh=True)
+        state = db.get_daily_log_state(day)
+        if state is None:
+            template = db.get_most_recent_daily_log_state()
+            if template is None:
+                return None
+            state = DailyLogState(
+                date_day=(day - LOSEIT_EPOCH).days,
+                current_weight=template.current_weight,
+                current_eer=template.current_eer,
+                current_activity_level=template.current_activity_level,
+                budget_calories=template.budget_calories,
+                food_calories=0.0,
+                exercise_calories=0.0,
+            )
+        new_food_calories = max(0.0, state.food_calories + delta_calories)
+        return daily_log_entry(
+            date_day=state.date_day,
+            budget_calories=state.budget_calories,
+            weight=state.current_weight,
+            eer=state.current_eer,
+            activity_level=state.current_activity_level,
+            food_calories=new_food_calories,
+            exercise_calories=state.exercise_calories,
+            last_updated_ms=now_ms(),
+        )
+
+    def _existing_entry_calories(self, entry_uuid: bytes) -> float:
+        """Look up an existing food log entry's calories (for computing
+        the delta on edit/delete). Returns 0.0 if not found."""
+        db = self.database(refresh=False)
+        row = db._con.execute(  # type: ignore[attr-defined]
+            "SELECT Calories FROM FoodLogEntries WHERE UniqueId = ? AND Deleted = 0",
+            (entry_uuid,),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
     def _next_sync_token(self) -> int:
         t = max(int(time.time() * 1000) - 1000, self._last_sync_token + 1)
         self._last_sync_token = t
@@ -128,10 +191,12 @@ class LoseItClient:
             meal=meal,
             day=day,
         )
+        daily = self._build_daily_log_delta(day, float(calories))
         bundle = build_add_calories_bundle(
             entry,
             user_id=self.user_id,
             sync_token=self._next_sync_token(),
+            daily_log_entry_bytes=daily,
         )
         resp = self.transport.post_transaction_bundle(bundle)
         parsed = parse_bundle_response(resp)
@@ -172,10 +237,13 @@ class LoseItClient:
             entry_uuid=entry_uuid,
             food_uuid=food_uuid,
         )
+        prev_calories = self._existing_entry_calories(entry_uuid)
+        daily = self._build_daily_log_delta(day, float(calories) - prev_calories)
         bundle = build_add_calories_bundle(
             entry,
             user_id=self.user_id,
             sync_token=self._next_sync_token(),
+            daily_log_entry_bytes=daily,
         )
         resp = self.transport.post_transaction_bundle(bundle)
         parsed = parse_bundle_response(resp)
@@ -217,6 +285,9 @@ class LoseItClient:
             )
         scale = _local_scale(food, servings=servings, quantity=quantity)
         raw_amount = (food.last_serving_quantity or 1.0) * scale
+        new_calories = food.last_serving_calories * scale
+        prev_calories = self._existing_entry_calories(entry_uuid)
+        daily = self._build_daily_log_delta(day, new_calories - prev_calories)
         bundle, _ = build_log_food_bundle(
             food_uuid=food.food_uuid,
             food_name=food.name,
@@ -226,7 +297,7 @@ class LoseItClient:
             measure_plural=food.measure_name_plural,
             serving_quantity=raw_amount,
             serving_base_units=raw_amount,
-            calories=food.last_serving_calories * scale,
+            calories=new_calories,
             fat=food.last_serving_fat * scale,
             carbohydrate=food.last_serving_carbohydrate * scale,
             protein=food.last_serving_protein * scale,
@@ -235,6 +306,7 @@ class LoseItClient:
             sync_token=self._next_sync_token(),
             day=day,
             entry_uuid=entry_uuid,
+            daily_log_entry_bytes=daily,
         )
         resp = self.transport.post_transaction_bundle(bundle)
         parsed = parse_bundle_response(resp)
@@ -299,6 +371,8 @@ class LoseItClient:
 
         scale = _local_scale(food, servings=servings, quantity=quantity)
         raw_amount = (food.last_serving_quantity or 1.0) * scale
+        new_calories = food.last_serving_calories * scale
+        daily = self._build_daily_log_delta(day, new_calories)
 
         bundle, entry_uuid = build_log_food_bundle(
             food_uuid=food.food_uuid,
@@ -309,7 +383,7 @@ class LoseItClient:
             measure_plural=food.measure_name_plural,
             serving_quantity=raw_amount,
             serving_base_units=raw_amount,
-            calories=food.last_serving_calories * scale,
+            calories=new_calories,
             fat=food.last_serving_fat * scale,
             carbohydrate=food.last_serving_carbohydrate * scale,
             protein=food.last_serving_protein * scale,
@@ -317,6 +391,7 @@ class LoseItClient:
             user_id=self.user_id,
             sync_token=self._next_sync_token(),
             day=day,
+            daily_log_entry_bytes=daily,
         )
         resp = self.transport.post_transaction_bundle(bundle)
         parsed = parse_bundle_response(resp)
@@ -324,7 +399,7 @@ class LoseItClient:
             entry_uuid=entry_uuid,
             food_uuid=food.food_uuid,
             name=food.name,
-            calories=food.last_serving_calories * scale,
+            calories=new_calories,
             meal=meal,
             server_ack_txn_ids=parsed["ack_txn_ids"],
             raw_response_fields=parsed["raw_fields"],
@@ -392,7 +467,9 @@ class LoseItClient:
         measure_plural: str = "Each",
     ) -> dict:
         """Delete an existing log entry by re-sending it with the tombstone
-        flag set."""
+        flag set. Also decrements the DailyLogEntries banner so the
+        calorie total stays accurate."""
+        daily = self._build_daily_log_delta(day, -float(calories))
         bundle = build_delete_log_bundle(
             entry_uuid=entry_uuid,
             food_uuid=food_uuid,
@@ -408,6 +485,7 @@ class LoseItClient:
             measure_id=measure_id,
             measure_singular=measure_singular,
             measure_plural=measure_plural,
+            daily_log_entry_bytes=daily,
         )
         resp = self.transport.post_transaction_bundle(bundle)
         return parse_bundle_response(resp)
@@ -548,6 +626,8 @@ class LoseItClient:
         else:
             scale = 1.0
         raw_amount = serving_size * scale
+        new_calories = n.calories * scale
+        daily = self._build_daily_log_delta(day, new_calories)
 
         # decode_food_serving_size already filled these, but fall back
         # through the enum table in case it encountered an unknown id.
@@ -563,7 +643,7 @@ class LoseItClient:
             measure_plural=plural,
             serving_quantity=raw_amount,
             serving_base_units=raw_amount,
-            calories=n.calories * scale,
+            calories=new_calories,
             fat=n.fat * scale,
             carbohydrate=n.carbohydrates * scale,
             protein=n.protein * scale,
@@ -571,6 +651,7 @@ class LoseItClient:
             user_id=self.user_id,
             sync_token=self._next_sync_token(),
             day=day,
+            daily_log_entry_bytes=daily,
         )
         resp = self.transport.post_transaction_bundle(bundle)
         parsed = parse_bundle_response(resp)
@@ -578,7 +659,7 @@ class LoseItClient:
             entry_uuid=entry_uuid,
             food_uuid=food.unique_id,
             name=food.name,
-            calories=n.calories * scale,
+            calories=new_calories,
             meal=meal,
             server_ack_txn_ids=parsed["ack_txn_ids"],
             raw_response_fields=parsed["raw_fields"],
