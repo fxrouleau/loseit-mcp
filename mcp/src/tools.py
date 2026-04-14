@@ -86,17 +86,27 @@ def register(mcp: Any, client: LoseItClient) -> None:
     """
 
     # ---- routing guidance for the LLM -----------------------------
-    # When the user describes a meal:
+    # The "right" tool depends on how much the food's macros vary
+    # across instances of the same name:
     #
-    #   * Simple, identifiable single foods (apple, egg, chicken breast,
-    #     a specific packaged item) → search_foods / search_catalog /
-    #     barcode_lookup, then log_food.
+    #   * Low variance: raw whole foods (apple, banana, carrot, egg,
+    #     plain chicken breast, cooked rice) and fully refined branded
+    #     products (Goldfish crackers, a specific protein bar, a
+    #     specific cereal). 1 of these means the same thing every
+    #     time. → search_foods → log_food, or search_catalog →
+    #     log_food, or barcode_lookup → log_food.
     #
-    #   * Complex / mixed meals where no single catalog item fits
-    #     (homemade dishes, restaurant plates with multiple components,
-    #     anything where calorie estimates vary widely) → log_calories
-    #     with a descriptive name. This is the common case — don't
-    #     reach for the catalog unless the food is unambiguous.
+    #   * High variance: cooked / mixed / restaurant / homemade meals
+    #     where the same name covers wildly different calorie counts
+    #     (bun bo hue, pho, chicken pot pie, a slice of cake, a bowl
+    #     of ice cream, "pasta with sauce", any restaurant dish).
+    #     Forcing a catalog match would mis-represent what the user
+    #     actually ate. → log_calories with a descriptive name and
+    #     your best macro estimate.
+    #
+    # When in doubt, prefer log_calories. The descriptive name is the
+    # entry's title in the user's log and matters more than catalog
+    # accuracy for non-trivial meals.
 
     @mcp.tool()
     def list_units() -> list[dict[str, Any]]:
@@ -208,11 +218,17 @@ def register(mcp: Any, client: LoseItClient) -> None:
         food_uuid: str,
         meal: str,
         servings: float = 1.0,
-        measure: Optional[str] = None,
         serving_index: int = 0,
         date: Optional[str] = None,
     ) -> dict[str, Any]:
         """Log a food entry for a single identifiable food.
+
+        **Use this for raw / refined items only**: apple, banana,
+        carrot, egg, chicken breast, plain rice, a specific branded
+        packaged product. For variable / cooked / restaurant /
+        homemade meals (bun bo hue, pho, ice cream, cake, pasta with
+        sauce, etc.) use `log_calories` instead — the catalog will
+        mis-represent what the user actually ate.
 
         Accepts a `food_uuid` from any of:
           - search_foods       (user's personal library)
@@ -225,10 +241,10 @@ def register(mcp: Any, client: LoseItClient) -> None:
         ## How to specify "how much"
 
         Use **`servings`**: the number of standard servings of the
-        food, exactly as the user describes it. This matches LoseIt's
-        own picker behaviour:
+        food, exactly as the user describes it. Matches the LoseIt
+        app's picker behaviour:
 
-        * "log 2 carrots"      → servings=2 (logs 2 × the food's serving)
+        * "log 2 carrots"      → servings=2 (= 2 × the food's serving)
         * "log 1 apple"        → servings=1   (or omit; default is 1)
         * "log half a banana"  → servings=0.5
 
@@ -236,32 +252,29 @@ def register(mcp: Any, client: LoseItClient) -> None:
         serving size. You DO NOT need to think about grams or units.
         For a carrot whose catalog entry has serving "61 Grams",
         `servings=2` correctly logs 122 grams (50 cal). For an apple
-        stored as "1 Each", `servings=2` logs 2 each. The math is
-        always `servings × serving_size_value`.
+        stored as "1 Each", `servings=2` logs 2 each.
 
-        ### When the user gives a raw weight or volume
+        ## When the user gives a raw weight or volume
 
         If the user says "200 grams of carrot" and the food's serving
         is "61 Grams", compute it yourself:
             servings = 200 / 61 ≈ 3.28
-        Don't try to pass a measure-units number directly — there's no
-        parameter for that, on purpose, because it's the #1 mistake
-        callers make.
+        There is intentionally no `quantity_in_grams` parameter — it's
+        the most common source of bugs.
 
-        ### When the user wants a different unit
+        ## When the user wants a different unit than what's stored
 
-        Use `measure`. e.g. food's stored measure is "Each" but user
-        says "100 grams of it" → measure="GRAM". The tool re-fetches
-        the food from the catalog under the requested measure, and
-        `servings` then applies to the new serving size.
+        Call `search_catalog` for the food, look at the `servings`
+        list in each result, pick the one that has the unit you want,
+        and pass that food_uuid + serving_index. Don't try to "convert"
+        a local-library food into a different unit through this tool —
+        you'll either get an error or the wrong food.
 
         Args:
             food_uuid: hex uuid from a search/lookup response.
             meal: "breakfast" | "lunch" | "dinner" | "snacks".
             servings: number of servings (multiplier on serving size).
                 Default 1.0.
-            measure: optional unit override for foods from
-                search_foods, e.g. "GRAM", "CUP" — see list_units.
             serving_index: which entry of the food's `servings` list
                 to use, for catalog/barcode foods that expose multiple
                 units (e.g. "27 Pieces" + "40 Grams"). Default 0.
@@ -269,9 +282,6 @@ def register(mcp: Any, client: LoseItClient) -> None:
             date: ISO date (YYYY-MM-DD). Defaults to today.
 
         Returns the new log entry's metadata.
-
-        Note: this is for individual foods only. For complex meals
-        without a clear catalog match, use log_calories instead.
         """
         fu = bytes.fromhex(food_uuid)
 
@@ -284,7 +294,6 @@ def register(mcp: Any, client: LoseItClient) -> None:
                 food_uuid=fu,
                 meal=_meal_from_str(meal),
                 servings=servings,
-                measure_id=_measure_from_str(measure),
                 day=_date_from_str(date),
             )
         else:
@@ -322,19 +331,26 @@ def register(mcp: Any, client: LoseItClient) -> None:
     ) -> dict[str, Any]:
         """Log a free-form calorie + macros entry under a descriptive name.
 
-        This is the **default** way to log a meal in this server. Use
-        it any time the user describes a multi-ingredient dish, a
-        restaurant meal, a homemade recipe, or anything where forcing
-        a single catalog match would mis-represent the food.
+        ## When to use this
 
-        The `name` becomes the title of the log entry in the LoseIt
-        UI — make it descriptive ("Bun bo hue, large bowl",
-        "homemade chicken tikka masala 1 plate", "leftover pasta") so
-        future-you can read the log and remember what it was. Macros
-        should be your best estimate.
+        Anything where the same name covers a wide range of actual
+        macros: cooked dishes, restaurant meals, homemade recipes,
+        mixed plates, ice cream of a non-specific brand, "pasta with
+        sauce", "pho", "bun bo hue", "chicken pot pie", "a slice of
+        cake", "leftovers". The catalog has entries for these but
+        forcing a match would mis-represent what the user actually
+        ate. Estimate macros yourself and write a descriptive name.
 
-        Use log_food only for unambiguous single foods (an apple, a
-        slice of bread, a specific packaged item).
+        Reach for `log_food` only when the food is **low-variance**:
+        a raw whole food (apple, banana, carrot, egg, plain rice) or a
+        fully refined branded product (Goldfish, a specific protein
+        bar, a specific cereal). When in doubt, use this tool.
+
+        The `name` becomes the title of the entry in the LoseIt log,
+        so make it descriptive — "Bun bo hue large bowl" beats
+        "soup", "homemade chicken tikka masala 1 plate" beats
+        "chicken curry". Future-you needs to read the log and
+        remember what it was.
         """
         r = client.log_calories(
             name=name,

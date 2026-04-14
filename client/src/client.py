@@ -341,22 +341,24 @@ class LoseItClient:
         day: Optional[dt.date],
     ) -> LoggedEntry:
         """Fallback path for log_food when the caller asks for a unit the
-        local library doesn't have. Hits the catalog to fetch the alternate
-        serving, then routes through log_food_from_catalog.
+        local library doesn't have. Hits the catalog to find the SAME
+        food (by uuid) under a different measure.
+
+        We deliberately do NOT fall back to a different food when the
+        catalog search misses — that previously caused silent food swaps
+        (e.g. requesting 'Carrot, Whole' returned 'Carrot Stick Whole').
+        Caller should use search_catalog directly to pick a different
+        food if no exact match exists.
         """
-        # Search by food name; match on uniqueId.
         candidates = self.search_catalog(food.name, limit=20)
         match = next((f for f in candidates if f.unique_id == food.food_uuid), None)
         if match is None:
-            # Fall back to name match — catalog uuids can differ from the
-            # user's copy when the entry is a custom food or an older
-            # snapshot. Pick the first result as best-effort.
-            if not candidates:
-                raise LookupError(
-                    f"catalog has no match for {food.name!r}; cannot log "
-                    f"in alternate unit"
-                )
-            match = candidates[0]
+            raise LookupError(
+                f"food {food.name!r} ({food.food_uuid.hex()}) is not in "
+                f"the catalog under that uuid, so it can't be re-logged in "
+                f"a different measure. Use search_catalog directly to find "
+                f"a matching food with the unit you want."
+            )
         serving_index = next(
             (i for i, s in enumerate(match.servings) if s.measure_id == measure_id),
             None,
