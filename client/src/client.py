@@ -40,22 +40,28 @@ class LoggedEntry:
 
 
 def _local_scale(food, *, servings: float | None, quantity: float | None) -> float:
-    """Resolve a `(servings, quantity)` pair into a single multiplier on
-    a local food's stored last-used serving.
+    """Resolve a `(servings, quantity)` pair for a local-library food into
+    a single multiplier that scales the food's stored last-serving values.
 
-    * `servings`: number of standard servings → multiplier is just N.
-      Matches the LoseIt app picker: "2" of a 61g serving = 122 grams.
-    * `quantity`: explicit raw amount in the food's measure unit, used
-      when the caller wants e.g. "exactly 200 grams". The multiplier is
-      `quantity / last_serving_quantity`.
-    * Neither: 1 serving (the food's last-used quantity).
+    **Important**: `servings=N` always means "N units of the food's
+    measure" — N apples for a food measured in Each, N grams for a
+    food measured in Gram. It does NOT mean "N times the user's last
+    logged amount". If the user's last log of Apple was 2 each
+    (stored as `last_serving_quantity=2, last_serving_calories=190`),
+    then `servings=1` logs 1 apple at 95 cal, not 2 apples at 190.
+
+    We normalise by dividing by `last_serving_quantity`, then the caller
+    multiplies the scale back into `last_serving_calories` etc. to get
+    the per-1-measure-unit values scaled up by `servings`.
+
+    Defaults: 1 measure unit (1 Each / 1 Gram / 1 whatever).
     """
     last_q = food.last_serving_quantity or 1.0
     if servings is not None:
-        return float(servings)
+        return float(servings) / last_q
     if quantity is not None:
         return float(quantity) / last_q
-    return 1.0
+    return 1.0 / last_q
 
 
 class LoseItClient:
